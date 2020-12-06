@@ -6,14 +6,16 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"time"
 
-	"github.com/eminetto/clean-architecture-go-v2/infrastructure/repository"
-	"github.com/eminetto/clean-architecture-go-v2/usecase/book"
+	"go.uber.org/fx"
+
+	"context"
 
 	"github.com/eminetto/clean-architecture-go-v2/config"
-	_ "github.com/go-sql-driver/mysql"
-
 	"github.com/eminetto/clean-architecture-go-v2/pkg/metric"
+	"github.com/eminetto/clean-architecture-go-v2/usecase/book"
+	_ "github.com/go-sql-driver/mysql"
 )
 
 func handleParams() (string, error) {
@@ -23,36 +25,116 @@ func handleParams() (string, error) {
 	return os.Args[1], nil
 }
 
-func main() {
-	metricService, err := metric.NewPrometheusService()
-	if err != nil {
-		log.Fatal(err.Error())
-	}
-	appMetric := metric.NewCLI("search")
-	appMetric.Started()
-	query, err := handleParams()
-	if err != nil {
-		log.Fatal(err.Error())
-	}
-
+// NewSQLDB create and open database
+func NewSQLDB(lc fx.Lifecycle) (*sql.DB, error) {
 	dataSourceName := fmt.Sprintf("%s:%s@tcp(%s:3306)/%s?parseTime=true", config.DB_USER, config.DB_PASSWORD, config.DB_HOST, config.DB_DATABASE)
 	db, err := sql.Open("mysql", dataSourceName)
 	if err != nil {
 		log.Fatal(err.Error())
 	}
-	defer db.Close()
-	repo := repository.NewBookMySQL(db)
-	service := book.NewService(repo)
-	all, err := service.SearchBooks(query)
+
+	lc.Append(
+		fx.Hook{
+			OnStart: func(context.Context) error {
+				log.Println("Start NewSqlDB")
+				return nil
+			},
+			OnStop: func(context.Context) error {
+				log.Println("Stop NewSqlDB")
+				db.Close()
+				return nil
+			},
+		},
+	)
+
+	return db, err
+}
+
+// NewPrometheusService wrap NewPrometheusService for adding hooks
+func NewPrometheusService(lc fx.Lifecycle) (metric.Service, error) {
+
+	metricService, err := metric.NewPrometheusService()
+	appMetric := metric.NewCLI("search")
+
+	lc.Append(
+		fx.Hook{
+			OnStart: func(context.Context) error {
+				log.Println("Start NewPrometheusService")
+				appMetric.Started()
+				return nil
+			},
+			OnStop: func(context.Context) error {
+				log.Println("Stop NewPrometheusService")
+				appMetric.Finished()
+				err = metricService.SaveCLI(appMetric)
+				if err != nil {
+					log.Fatal(err)
+				}
+				return nil
+			},
+		},
+	)
+	return metricService, err
+}
+
+var bookSrv *book.Service
+
+func BookService(service book.UseCase) error {
+
+	var ok bool
+	if bookSrv, ok = service.(*book.Service); !ok {
+		return errors.New("invalid type: book service ")
+	}
+
+	return nil
+}
+
+// core options for fx
+func opts() fx.Option {
+	return fx.Options(
+		fx.Provide(
+			NewSQLDB,
+			//NewPrometheusService,
+		),
+
+		config.ServiceConstructor,
+
+		fx.Invoke(NewPrometheusService),
+		fx.Invoke(BookService),
+	)
+}
+
+func main() {
+	app := fx.New(opts())
+
+	// 	// In a typical application, we could just use app.Run() here. Since we
+	// don't want this example to run forever, we'll use the more-explicit Start
+	// and Stop.
+	startCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := app.Start(startCtx); err != nil {
+		log.Fatal(err)
+	}
+
+	// instances of service has been initilized.
+	log.Println(bookSrv)
+	query, err := handleParams()
+	if err != nil {
+		log.Fatal(err.Error())
+	}
+
+	all, err := bookSrv.SearchBooks(query)
 	if err != nil {
 		log.Fatal(err)
 	}
+
 	for _, j := range all {
 		fmt.Printf("%s %s \n", j.Title, j.Author)
 	}
-	appMetric.Finished()
-	err = metricService.SaveCLI(appMetric)
-	if err != nil {
+
+	stopCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := app.Stop(stopCtx); err != nil {
 		log.Fatal(err)
 	}
 }
